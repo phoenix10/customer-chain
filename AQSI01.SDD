@@ -1,0 +1,124 @@
+>>20101129 9.0 Z10-10112500001 自动报价整合至90标准版
+程序编号： AQSI01
+程序名称： 录入报价参数权限
+Parent class ：DsDouble
+系统分析编号：
+信息文档： ADMMF (R/W) 用户信息档
+           ADMMG (R/W) 用户权限信息档
+           ADMME (R/O) 组信息档
+           COPEC (R/O) 自定义报价参数档
+           COPER (R/O) 参数限定人员信息档       
+           DSCMA (R/O) 登录者编号档->dscsys     
+           ADMMU (R/O) 用户作业扩展权限设置档
+           AQSMA (R/W) 人员报价权限信息单头档
+           AQSMB (R/W) 人员报价权限信息单身档 
+           
+输入画面：
+
+    单头画面
+  
+  <基本信息>
+        类别 ◎用户  ○组                         
+    用户编号 <…>       组编号 <…> CCCCCCCCCC     超级报价员
+    用户名称           备注 ●                            
+      
+    单身画面 
+       
+   参数编号<…> 参数名称   基本权限  信息控制 组权限  他组权限
+
+
+字段说明:
+
+1.类别(MA004)
+   1.人员 2.组
+   DEF 1.人员
+   若为2.组 则人员DEF全* 且DISABLE
+   
+2.人员编号(MA001)
+     * 不可空白
+  IF 类别(MA004)='1' THEN 
+     * 输入时须check DSCMA(登录者编号档),须存在DSC.MA001中才可输入  
+      Validator:DSCMA-02 CHECK 登录者编号 
+      Msg code:E+100001 "输入的 %S并不存在, 请重新输入"  
+    * [F2]登录者编号信息查询 (DSCMA-02)            
+    * 以登录者名称(DSC.MA002) DEFAULT 用户名称  
+    * Validator:E-43 CHECK 用户编号                   
+      Msg code:E+100002 "输入的 %S已经存在, 请重新输入"
+
+  ENDIF 
+   
+3.人员名称
+  * DISPLAY ONLY 
+  
+3.组编号(MA002)
+   * 不可空白
+  IF 类别(MA004)='1' THEN 
+    * [F2] 组信息查询 (ADMME-01)
+    * Validator:ADMME-01 check 组信息档 SHOW ERROR MSG
+     * SHOW 组名称
+  ELSE
+    * [F2] 组信息查询 (E-16)   
+    * Validator:ADMME-01 check 组信息档 SHOW ERROR MSG
+      Msg code:E+000001 "输入的 %S并不存在, 请重新输入"
+    * Validator:E-44 Where 组编号=:MA002 CHECK 组编号
+      Msg code:E+000002 "输入的 %S已经存在, 请重新输入"
+    * SHOW 组名称
+  ENDIF
+
+4.备注(MA003)   
+    * 常用语开窗 
+    
+5.超级报价员(MA005)
+    * ONLY Y/N
+    * DEF N
+    * 若为Y 则不受单身权限设置控制->单身权限应皆隐藏  
+     
+单身字段 
+ 1. 人员编号(MB001)
+  * 隐藏字段
+  * DEF 单头人员编号(MA001)  
+  
+ 2. 组编号(MB002)
+  * 隐藏字段                  
+  * DEF 单头组编号(MA002)
+    
+ 3.参数编号(MB003) 
+    * [F2]自定义报价参数信息查询 (E-22),show参数名称//E-03->E-22
+    * Validator:E-48 CHECK 自定义报价参数信息档，Show Error Msg// E-13 ->E-48         
+    * Msg Code:E+000001'输入的 %S 并不存在, 请重新输入' %S='参数代号'   
+    * Validator:E-45 Where 人员 ,组编号 , :MB003 IN ('',MB003)CHECK 人员参数权限档，Show Error Msg             
+    * Msg Code:E+000002'输入的 %S已经存在, 请重新输入' %S='参数代号'  
+    
+  4.基本权限(MB004)
+    * default YNNNNNNNNNNNNNNN 
+    * ONLY  Y/N
+    * 字段 Byte 代表意义如下:
+    Byte1 Byte2 Byte3  Byte4 - Byte16 
+    一般 只读  隐藏   保留
+    其中Byte1 - Byte3三者只能一个为Y
+    
+  5.信息控制(MB005)
+    * default N
+    * ONLY  Y/N
+    * 为Y 时才可设置"组权限"和"他组权限"  
+    
+  6.组权限(MB006)
+    * default YNNNNNNNNNNNNNNN 
+    * ONLY  Y/N
+    * 字段 Byte 代表意义如下:
+    Byte1 Byte2 Byte3  Byte4 - Byte16 
+    一般 只读  隐藏   保留
+    其中Byte1 - Byte3三者只能一个为Y
+ 
+ 7.他组权限(MB007)
+    * default YNNNNNNNNNNNNNNN 
+    * ONLY  Y/N
+    * 字段 Byte 代表意义如下:
+    Byte1 Byte2 Byte3  Byte4 - Byte16 
+    一般 只读  隐藏   保留
+    其中Byte1 - Byte3三者只能一个为Y 
+  
+信息处理
+  1.KeyUnique:
+   CHECK 单头信息:Validator:E-46 Where MA002=:组编号 AND MA001=:人员编号 若存在 show error msg。
+   CHECK 单身信息:Validator:E-45 Where 人员 ,组编号 , :MB003 IN ('',MB003)CHECK 人员参数权限档，Show Error Msg   

@@ -1,0 +1,781 @@
+全自定义自动报价系统（纯代码开发，无低代码依赖）
+
+一、系统核心设计（通用化核心）
+
+核心目标：让用户（管理员）无需修改代码，即可自行配置「产品参数、计算公式、报价组成、BOM物料、开模规则」，业务员仅需选择配置好的模板，输入参数即可自动报价。整体架构仍采用前后端分离（Python+FastAPI+PostgreSQL+原生前端），重点新增「配置模块、BOM物料模块、开模规则模块」，实现全流程自定义，适配小批量开模、BOM物料灵活引用场景。
+
+1. 通用化设计核心思路
+
+- 参数自定义：用户可新增任意产品类型，为每种产品配置专属参数（如尺寸、基重、淋膜量、厚度等，支持数字/文本/下拉类型）；
+
+- 公式自定义：用户可通过可视化/文本方式，为产品配置核心计算公式（如克重、单耗、物料成本公式），支持参数变量、基础运算、函数调用、BOM物料引用；
+
+- 报价组成自定义：用户可自由配置报价的成本项（如物料成本、工艺成本、运费、税费、利润、开模费），每个成本项可绑定自定义计算规则，开模费支持按订单数量阈值触发；
+
+- 模板化管理：将「产品参数+计算公式+报价组成+BOM物料+开模规则」封装为报价模板，业务员直接选择模板、输入参数，系统自动执行计算（含开模费判断、BOM物料引用），无需关注底层逻辑；
+
+- BOM物料灵活引用：新增BOM物料管理，支持物料分类、物料单价维护，公式可直接引用BOM物料单价/用量，实现物料成本灵活计算；
+
+- 开模费规则自定义：支持配置开模费阈值（如5000数量以下）、开模费金额/计算公式，系统自动根据订单数量判断是否触发开模费，无需人工干预。
+
+2. 系统整体架构（新增配置层+BOM层+开模规则层）
+
+graph TD
+        A[前端层（HTML/JS/CSS）] --> B[后端API层（FastAPI）]
+        B --> C[核心业务层]
+        C --> C1[配置管理模块（参数/公式/报价组成）]
+        C --> C2[报价计算模块（调用配置规则+开模规则+BOM物料）]
+        C --> C3[模板管理模块]
+        C --> C4[BOM物料管理模块]
+        C --> C5[开模规则管理模块]
+        C --> D[数据持久层（PostgreSQL）]
+        D --> C
+        C --> B
+        B --> A
+
+新增「配置管理模块」「模板管理模块」「BOM物料管理模块」「开模规则管理模块」，作为系统通用化的核心；其中BOM物料模块负责物料维护与引用，开模规则模块负责小批量开模费触发逻辑，所有自定义规则均通过这四个模块存储和调用，核心业务层仅负责执行规则，无需硬编码任何产品/公式/物料/开模逻辑。
+
+二、前置准备（开发环境+数据库设计）
+
+1. 开发环境搭建（替换为FastAPI+PostgreSQL依赖）
+
+# 安装核心依赖（FastAPI+PostgreSQL驱动+公式解析+Excel导出）
+pip install fastapi uvicorn psycopg2-binary pandas openpyxl sympy python-multipart
+
+2. 数据库表设计（适配PostgreSQL，核心新增配置表+BOM表+开模规则表，支持自定义）
+
+共10张表，在原有8张表基础上，新增「BOM物料表、开模规则表」，适配PostgreSQL语法，SQL可直接执行（PostgreSQL支持JSON类型，无需额外处理JSON格式转换），重点支持BOM物料引用、开模费阈值判断：
+
+-- 1. 产品类型表（用户可新增产品，如淋膜纸片、底纸、覆膜纸等）
+CREATE TABLE product_type (
+  type_id SERIAL PRIMARY KEY COMMENT '产品类型ID',
+  type_name VARCHAR(50) NOT NULL COMMENT '产品类型名称（如淋膜纸片）',
+  type_desc TEXT COMMENT '产品描述',
+  create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. 参数配置表（用户为每种产品配置专属参数，如长度、基重等）
+CREATE TABLE param_config (
+  param_id SERIAL PRIMARY KEY COMMENT '参数ID',
+  type_id INT NOT NULL COMMENT '关联产品类型ID',
+  param_name VARCHAR(50) NOT NULL COMMENT '参数名称（如长度、基重）',
+  param_type VARCHAR(20) NOT NULL COMMENT '参数类型（number：数字/text：文本/select：下拉）',
+  param_unit VARCHAR(20) COMMENT '参数单位（如cm、g/㎡）',
+  param_options JSONB COMMENT '下拉参数的选项（JSON格式，如["单面","双面"]）',
+  is_required INT DEFAULT 1 COMMENT '是否必填（1=是，0=否）',
+  default_value VARCHAR(50) COMMENT '默认值',
+  create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (type_id) REFERENCES product_type(type_id) ON DELETE CASCADE
+);
+
+-- 3. 公式配置表（用户自定义计算公式，如克重、物料成本公式，支持引用BOM物料）
+CREATE TABLE formula_config (
+  formula_id SERIAL PRIMARY KEY COMMENT '公式ID',
+  formula_name VARCHAR(50) NOT NULL COMMENT '公式名称（如单张克重公式）',
+  formula_expr TEXT NOT NULL COMMENT '公式表达式（如"(length*width/10000)*base_weight"，支持引用bom_price）',
+  formula_desc TEXT COMMENT '公式描述',
+  param_ids JSONB NOT NULL COMMENT '关联的参数ID（JSON格式，如[1,2,3]）',
+  bom_ids JSONB COMMENT '关联的BOM物料ID（JSON格式，如[1,2]，可选）',
+  result_unit VARCHAR(20) COMMENT '计算结果单位（如g、元）',
+  create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 4. 工艺配置表（用户可新增任意工艺，自定义加价规则）
+CREATE TABLE process_config (
+  process_id SERIAL PRIMARY KEY COMMENT '工艺ID',
+  process_name VARCHAR(50) NOT NULL COMMENT '工艺名称（如淋膜、模切）',
+  add_type VARCHAR(20) NOT NULL COMMENT '加价方式（area/unit/ratio：按面积/按单张/按比例）',
+  add_expr TEXT NOT NULL COMMENT '加价计算公式（如"total_area*0.5"）',
+  min_order INT DEFAULT 0 COMMENT '起订量',
+  create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5. 报价组成配置表（用户自定义报价的成本项，新增开模费项）
+CREATE TABLE quote_component (
+  component_id SERIAL PRIMARY KEY COMMENT '成本项ID',
+  component_name VARCHAR(50) NOT NULL COMMENT '成本项名称（如物料成本、工艺成本、开模费）',
+  calc_expr TEXT NOT NULL COMMENT '成本项计算公式（如"total_weight_ton*price_per_ton"，开模费可填固定值或公式）',
+  component_type VARCHAR(20) NOT NULL COMMENT '成本项类型（material/process/other/mold：物料/工艺/其他/开模费）',
+  is_required INT DEFAULT 1 COMMENT '是否必选（1=是，0=否，开模费可设为0，按规则触发）',
+  create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 6. 报价模板表（封装「产品参数+公式+报价组成+工艺+BOM物料+开模规则」，业务员直接使用）
+CREATE TABLE quote_template (
+  template_id SERIAL PRIMARY KEY COMMENT '模板ID',
+  template_name VARCHAR(50) NOT NULL COMMENT '模板名称（如淋膜纸片报价模板）',
+  type_id INT NOT NULL COMMENT '关联产品类型ID',
+  formula_ids JSONB NOT NULL COMMENT '关联的公式ID（JSON格式，如[1,2]）',
+  component_ids JSONB NOT NULL COMMENT '关联的报价组成ID（JSON格式，如[1,2,3,4,5]）',
+  process_ids JSONB COMMENT '默认关联的工艺ID（JSON格式，可选）',
+  bom_ids JSONB COMMENT '默认关联的BOM物料ID（JSON格式，可选）',
+  mold_rule_id INT COMMENT '关联的开模规则ID（可选，无则不触发开模费）',
+  template_desc TEXT COMMENT '模板描述',
+  create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (type_id) REFERENCES product_type(type_id) ON DELETE CASCADE,
+  FOREIGN KEY (mold_rule_id) REFERENCES mold_rule(rule_id) ON DELETE SET NULL
+);
+
+-- 7. 基础价格表（用户配置各类基础价格，如纸张单价、运费单价，可关联产品类型）
+CREATE TABLE base_price (
+  price_id SERIAL PRIMARY KEY COMMENT '价格ID',
+  price_name VARCHAR(50) NOT NULL COMMENT '价格名称（如淋膜纸片单价）',
+  type_id INT COMMENT '关联产品类型ID（可为空，通用价格）',
+  price_value FLOAT NOT NULL COMMENT '价格值（如8500元/吨）',
+  price_unit VARCHAR(20) NOT NULL COMMENT '价格单位（如元/吨、元/㎡）',
+  create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (type_id) REFERENCES product_type(type_id) ON DELETE SET NULL
+);
+
+-- 8. 报价记录表（存储历史报价，便于追溯，新增开模费、BOM物料明细）
+CREATE TABLE quote_record (
+  quote_id VARCHAR(32) PRIMARY KEY COMMENT '报价单ID（UUID）',
+  template_id INT NOT NULL COMMENT '关联报价模板ID',
+  param_values JSONB NOT NULL COMMENT '输入的参数值（JSON格式）',
+  process_values JSONB COMMENT '选中的工艺及参数（JSON格式）',
+  bom_values JSONB COMMENT '引用的BOM物料及用量（JSON格式）',
+  component_details JSONB NOT NULL COMMENT '各成本项明细（含开模费，JSON格式）',
+  total_price FLOAT NOT NULL COMMENT '总报价',
+  unit_price FLOAT NOT NULL COMMENT '单价',
+  mold_fee FLOAT DEFAULT 0 COMMENT '开模费金额（单独记录，便于追溯）',
+  creator VARCHAR(20) DEFAULT 'system' COMMENT '创建人',
+  create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (template_id) REFERENCES quote_template(template_id) ON DELETE CASCADE
+);
+
+-- 新增9. BOM物料表（物料管理，支持灵活引用，适配物料成本计算）
+CREATE TABLE bom_material (
+  bom_id SERIAL PRIMARY KEY COMMENT 'BOM物料ID',
+  bom_name VARCHAR(50) NOT NULL COMMENT '物料名称（如牛皮纸、PE淋膜料）',
+  bom_type VARCHAR(30) NOT NULL COMMENT '物料类型（如基材、辅料、耗材）',
+  bom_price FLOAT NOT NULL COMMENT '物料单价（如8500元/吨、12元/㎡）',
+  price_unit VARCHAR(20) NOT NULL COMMENT '单价单位（如元/吨、元/㎡、元/kg）',
+  bom_desc TEXT COMMENT '物料描述（如"300g牛皮纸，适合包装"）',
+  is_active INT DEFAULT 1 COMMENT '是否启用（1=启用，0=禁用）',
+  create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 新增10. 开模规则表（配置开模费阈值、金额，适配5000数量以下加开模费场景）
+CREATE TABLE mold_rule (
+  rule_id SERIAL PRIMARY KEY COMMENT '开模规则ID',
+  rule_name VARCHAR(50) NOT NULL COMMENT '规则名称（如"5000以下加开模费"）',
+  min_quantity INT NOT NULL COMMENT '开模阈值（订单数量低于此值触发，如5000）',
+  mold_fee_type VARCHAR(20) NOT NULL COMMENT '开模费类型（fixed：固定金额，formula：公式计算）',
+  mold_fee_value FLOAT COMMENT '固定开模费金额（mold_fee_type为fixed时必填）',
+  mold_fee_expr TEXT COMMENT '开模费计算公式（mold_fee_type为formula时必填，如"order_quantity*0.5"）',
+  rule_desc TEXT COMMENT '规则描述（如"订单数量＜5000时，收取固定开模费500元"）',
+  create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 初始化测试数据（用户可后期自行修改/新增）
+INSERT INTO product_type (type_name, type_desc) VALUES
+('淋膜纸片', '用于包装的淋膜处理纸片'),
+('底纸', '包装底部支撑用纸张');
+
+-- 初始化淋膜纸片参数
+INSERT INTO param_config (type_id, param_name, param_type, param_unit, is_required, default_value) VALUES
+(1, '长度', 'number', 'cm', 1, '10'),
+(1, '宽度', 'number', 'cm', 1, '8'),
+(1, '基重', 'number', 'g/㎡', 1, '80'),
+(1, '淋膜量', 'number', 'g/㎡', 1, '15'),
+(1, '订单数量', 'number', '张', 1, '1000'),
+(1, '纸张单价', 'number', '元/吨', 1, '8500');
+
+-- 初始化底纸参数
+INSERT INTO param_config (type_id, param_name, param_type, param_unit, is_required, default_value) VALUES
+(2, '长度', 'number', 'cm', 1, '12'),
+(2, '宽度', 'number', 'cm', 1, '10'),
+(2, '基重', 'number', 'g/㎡', 1, '120'),
+(2, '淋膜量', 'number', 'g/㎡', 1, '10'),
+(2, '订单数量', 'number', '张', 1, '1000'),
+(2, '纸张单价', 'number', '元/吨', 1, '7800');
+
+-- 初始化BOM物料（新增）
+INSERT INTO bom_material (bom_name, bom_type, bom_price, price_unit, bom_desc) VALUES
+('牛皮纸（80g）', '基材', 8500, '元/吨', '淋膜纸片核心基材，80g/㎡'),
+('PE淋膜料', '辅料', 12000, '元/吨', '用于淋膜工艺，防水防油'),
+('模切刀模', '耗材', 500, '元/套', '用于异形模切工艺，一次性开模耗材');
+
+-- 初始化开模规则（新增，适配5000以下加开模费）
+INSERT INTO mold_rule (rule_name, min_quantity, mold_fee_type, mold_fee_value, rule_desc) VALUES
+('5000以下加开模费', 5000, 'fixed', 500, '订单数量＜5000时，收取固定开模费500元'),
+('3000以下加开模费（公式）', 3000, 'formula', NULL, '订单数量＜3000时，开模费=订单数量×0.2，最低100元', 'order_quantity*0.2 if order_quantity*0.2≥100 else 100');
+
+-- 初始化公式（单张克重、总重量、物料成本，新增BOM物料引用）
+INSERT INTO formula_config (formula_name, formula_expr, formula_desc, param_ids, bom_ids, result_unit) VALUES
+('单张克重', '(length*width/10000)*base_weight + (length*width/10000)*coating_weight', '单张纸张克重=基纸克重+淋膜层克重', '[1,2,3,4]', NULL, 'g'),
+('总重量(吨)', '(single_weight*order_quantity)/1000000', '总重量=单张克重×订单数量÷1000000', '[6,7]', NULL, '吨'),
+('物料成本（基础）', 'total_weight_ton*paper_price', '物料成本=总重量×纸张单价', '[8,5]', NULL, '元'),
+('物料成本（BOM引用）', 'total_weight_ton*bom_price_1 + coating_weight*order_quantity*bom_price_2/1000000', '物料成本=基材重量×基材单价+淋膜料重量×淋膜料单价（引用BOM物料）', '[8,4,7]', '[1,2]', '元');
+
+-- 初始化工艺
+INSERT INTO process_config (process_name, add_type, add_expr, min_order) VALUES
+('双面淋膜', 'area', '(length*width*order_quantity/10000)*0.5', 1000),
+('异形模切', 'unit', 'order_quantity*0.1', 500),
+('四色印刷', 'area', '(length*width*order_quantity/10000)*1.2', 2000);
+
+-- 初始化报价组成（新增开模费项）
+INSERT INTO quote_component (component_name, calc_expr, component_type, is_required) VALUES
+('物料成本', 'material_cost', 'material', 1),
+('工艺成本', 'process_cost', 'process', 0),
+('运费', 'total_weight_ton*1000*0.005', 'other', 1),
+('税费', '(material_cost+process_cost+freight+mold_fee)*0.13', 'other', 1),
+('利润', '(material_cost+process_cost+freight+tax+mold_fee)*0.2', 'other', 1),
+('开模费', 'mold_fee', 'mold', 0); -- 开模费设为非必选，按规则触发
+
+-- 初始化报价模板（关联BOM物料、开模规则）
+INSERT INTO quote_template (template_name, type_id, formula_ids, component_ids, process_ids, bom_ids, mold_rule_id, template_desc) VALUES
+('淋膜纸片标准报价模板（BOM+开模）', 1, '[1,2,4]', '[1,2,3,4,5,6]', '[1,2]', '[1,2]', 1, '淋膜纸片通用报价模板，包含BOM物料引用、5000以下开模费规则，含物料、工艺、运费、税费、利润、开模费'),
+('底纸标准报价模板', 2, '[1,2,3]', '[1,2,3,4,5,6]', '[1]', NULL, 1, '底纸通用报价模板，5000以下加开模费，包含物料、工艺、运费、税费、利润、开模费');
+
+-- 初始化基础价格（可选，可关联产品类型）
+INSERT INTO base_price (price_name, type_id, price_value, price_unit) VALUES
+('淋膜纸片单价', 1, 8500, '元/吨'),
+('底纸单价', 2, 7800, '元/吨'),
+('运费单价', NULL, 0.005, '元/公斤');
+
+三、核心代码实现（后端+前端，全自定义支持，新增BOM+开模逻辑）
+
+核心亮点：新增「配置管理API」「公式解析工具」「BOM物料API」「开模规则API」，基于FastAPI重构后端，适配PostgreSQL数据库，支持用户通过前端界面配置参数、公式、报价组成、BOM物料、开模规则，后端自动解析公式、判断开模费、引用BOM物料，无需修改代码；重点适配两个场景：1、5000数量以下加开模费；2、物料部分可灵活引用BOM。
+
+1. 后端核心代码（FastAPI，适配PostgreSQL，新增自定义配置+BOM+开模逻辑）
+
+创建`custom_quote_system.py`，包含「配置管理、BOM物料管理、开模规则管理、公式解析、报价计算、API接口」全逻辑，基于FastAPI特性优化接口设计，适配PostgreSQL的JSONB类型，重点实现公式动态解析、BOM物料引用、开模费阈值判断：
+
+import uuid
+import json
+import psycopg2
+import psycopg2.extras
+import pandas as pd
+from sympy import sympify
+from fastapi import FastAPI, Request, Depends, HTTPException, Response, BackgroundTasks
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from datetime import datetime
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+import os
+
+# 初始化FastAPI应用
+app = FastAPI(title="全自定义自动报价系统", version="1.0.0")
+
+# 配置模板和静态文件（前端页面）
+templates = Jinja2Templates(directory="templates")
+if not os.path.exists("templates"):
+    os.makedirs("templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# -------------------------- 1. 工具函数：公式解析（核心，支持自定义公式+BOM物料引用） --------------------------
+def parse_formula(formula_expr: str, param_dict: Dict[str, Any], bom_dict: Dict[str, Any] = None) -> float:
+    """
+    解析自定义公式，代入参数值、BOM物料值计算结果
+    :param formula_expr: 公式表达式（字符串，如"(length*width/10000)*base_weight"，支持bom_price_1等BOM引用）
+    :param param_dict: 参数字典（key=参数名称，value=参数值，如{"length":10, "width":8}）
+    :param bom_dict: BOM物料字典（key=bom_price_+bom_id，value=物料单价，如{"bom_price_1":8500, "bom_price_2":12000}）
+    :return: 计算结果（保留4位小数）
+    """
+    try:
+        # 替换公式中的参数为实际值（支持嵌套公式结果）
+        expr = formula_expr
+        # 先替换参数值
+        for param_name, param_value in param_dict.items():
+            # 确保参数值为数字（避免文本参数干扰）
+            try:
+                param_value = float(param_value)
+                expr = expr.replace(param_name, str(param_value))
+            except (ValueError, TypeError):
+                continue
+        # 再替换BOM物料单价（若有）
+        if bom_dict:
+            for bom_key, bom_price in bom_dict.items():
+                try:
+                    bom_price = float(bom_price)
+                    expr = expr.replace(bom_key, str(bom_price))
+                except (ValueError, TypeError):
+                    continue
+        # 解析公式并计算（使用sympy避免eval的安全风险）
+        result = sympify(expr).evalf()
+        return round(float(result), 4)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"公式解析失败：{str(e)}，公式表达式：{formula_expr}")
+
+# -------------------------- 2. 工具函数：开模费计算（核心，适配5000数量以下加开模费） --------------------------
+def calculate_mold_fee(order_quantity: int, mold_rule: Dict[str, Any], param_dict: Dict[str, Any]) -> float:
+    """
+    根据订单数量和开模规则，计算开模费
+    :param order_quantity: 订单数量
+    :param mold_rule: 开模规则字典（含阈值、开模费类型、金额/公式）
+    :param param_dict: 参数字典（用于公式计算开模费时代入参数）
+    :return: 开模费金额（保留2位小数）
+    """
+    if not mold_rule:
+        return 0.0  # 无开模规则，不收取开模费
+    min_quantity = mold_rule["min_quantity"]
+    # 判断是否触发开模费（订单数量低于阈值）
+    if order_quantity >= min_quantity:
+        return 0.0
+    # 计算开模费
+    mold_fee_type = mold_rule["mold_fee_type"]
+    if mold_fee_type == "fixed":
+        # 固定金额开模费
+        return round(float(mold_rule["mold_fee_value"]), 2)
+    elif mold_fee_type == "formula":
+        # 公式计算开模费
+        mold_fee_expr = mold_rule["mold_fee_expr"]
+        mold_fee = parse_formula(mold_fee_expr, param_dict)
+        return round(mold_fee, 2)
+    else:
+        raise HTTPException(status_code=400, detail=f"不支持的开模费类型：{mold_fee_type}")
+
+# -------------------------- 3. 数据库连接配置（PostgreSQL） --------------------------
+def get_db_connection():
+    conn = psycopg2.connect(
+        host='localhost',  # 替换为你的PostgreSQL地址
+        user='postgres',   # 替换为你的PostgreSQL用户名
+        password='123456', # 替换为你的PostgreSQL密码
+        database='quote_system',  # 替换为你的数据库名
+        port=5432          # PostgreSQL默认端口
+    )
+    # 设置字典游标，便于获取JSONB字段
+    conn.autocommit = False
+    return conn
+
+# 依赖项：获取数据库连接
+def get_db():
+    conn = get_db_connection()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+# -------------------------- 4. Pydantic模型（接口请求/响应校验，新增BOM+开模相关模型） --------------------------
+class ProductTypeAdd(BaseModel):
+    type_name: str
+    type_desc: Optional[str] = ""
+
+class ParamAdd(BaseModel):
+    type_id: int
+    param_name: str
+    param_type: str  # number/text/select
+    param_unit: Optional[str] = ""
+    param_options: Optional[List[str]] = []
+    is_required: Optional[int] = 1
+    default_value: Optional[str] = ""
+
+class FormulaAdd(BaseModel):
+    formula_name: str
+    formula_expr: str
+    formula_desc: Optional[str] = ""
+    param_ids: List[int]
+    bom_ids: Optional[List[int]] = []  # 新增：关联BOM物料ID
+    result_unit: Optional[str] = ""
+
+class ProcessAdd(BaseModel):
+    process_name: str
+    add_type: str  # area/unit/ratio
+    add_expr: str
+    min_order: Optional[int] = 0
+
+class ComponentAdd(BaseModel):
+    component_name: str
+    calc_expr: str
+    component_type: str  # material/process/other/mold（新增mold开模费）
+    is_required: Optional[int] = 1
+
+# 新增：BOM物料模型
+class BomAdd(BaseModel):
+    bom_name: str
+    bom_type: str
+    bom_price: float
+    price_unit: str
+    bom_desc: Optional[str] = ""
+
+# 新增：开模规则模型
+class MoldRuleAdd(BaseModel):
+    rule_name: str
+    min_quantity: int
+    mold_fee_type: str  # fixed/formula
+    mold_fee_value: Optional[float] = None
+    mold_fee_expr: Optional[str] = None
+    rule_desc: Optional[str] = ""
+
+class TemplateAdd(BaseModel):
+    template_name: str
+    type_id: int
+    formula_ids: List[int]
+    component_ids: List[int]
+    process_ids: Optional[List[int]] = []
+    bom_ids: Optional[List[int]] = []  # 新增：关联BOM物料ID
+    mold_rule_id: Optional[int] = None  # 新增：关联开模规则ID
+    template_desc: Optional[str] = ""
+
+class QuoteCalculateParams(BaseModel):
+    template_id: int
+    param_values: Dict[str, Any]
+    process_ids: Optional[List[int]] = []
+    bom_ids: Optional[List[int]] = []  # 新增：可手动选择BOM物料（灵活引用）
+
+# -------------------------- 5. 核心模块1：配置管理（用户自定义参数/公式/工艺/报价组成） --------------------------
+# 5.1 产品类型管理（新增/查询/修改/删除）
+@app.get("/api/product/type/list", response_model=Dict[str, Any])
+def get_product_type_list(db: psycopg2.extensions.connection = Depends(get_db)):
+    """获取所有产品类型"""
+    with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("SELECT * FROM product_type ORDER BY create_time DESC")
+        types = cur.fetchall()
+        # 转换为字典列表（适配JSON响应）
+        types_list = [dict(type) for type in types]
+        return {"code": 200, "data": types_list}
+
+@app.post("/api/product/type/add", response_model=Dict[str, Any])
+def add_product_type(data: ProductTypeAdd, db: psycopg2.extensions.connection = Depends(get_db)):
+    """新增产品类型"""
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO product_type (type_name, type_desc) VALUES (%s, %s) RETURNING type_id",
+                (data.type_name, data.type_desc)
+            )
+            db.commit()
+            type_id = cur.fetchone()[0]
+        return {"code": 200, "msg": "产品类型新增成功", "data": {"type_id": type_id}}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"新增失败：{str(e)}")
+
+# 5.2 参数配置管理（新增/查询/修改/删除，关联产品类型）
+@app.get("/api/param/list", response_model=Dict[str, Any])
+def get_param_list(type_id: int, db: psycopg2.extensions.connection = Depends(get_db)):
+    """获取指定产品类型的参数配置"""
+    with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("SELECT * FROM param_config WHERE type_id = %s", (type_id,))
+        params = cur.fetchall()
+        # 解析JSONB类型的下拉参数选项
+        params_list = []
+        for param in params:
+            param_dict = dict(param)
+            if param_dict["param_type"] == "select" and param_dict["param_options"]:
+                param_dict["param_options"] = param_dict["param_options"]  # PostgreSQL JSONB直接转换为Python列表
+            params_list.append(param_dict)
+        return {"code": 200, "data": params_list}
+
+@app.post("/api/param/add", response_model=Dict[str, Any])
+def add_param(data: ParamAdd, db: psycopg2.extensions.connection = Depends(get_db)):
+    """新增参数配置"""
+    try:
+        # 处理下拉参数选项（转换为JSONB）
+        param_options = data.param_options if data.param_type == "select" else None
+        with db.cursor() as cur:
+            cur.execute("""
+                INSERT INTO param_config 
+                (type_id, param_name, param_type, param_unit, param_options, is_required, default_value)
+                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING param_id
+            """, (data.type_id, data.param_name, data.param_type, data.param_unit, param_options, data.is_required, data.default_value))
+            db.commit()
+            param_id = cur.fetchone()[0]
+        return {"code": 200, "msg": "参数配置新增成功", "data": {"param_id": param_id}}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"新增失败：{str(e)}")
+
+# 5.3 公式配置管理（新增/查询/修改/删除，关联参数+BOM物料）
+@app.get("/api/formula/list", response_model=Dict[str, Any])
+def get_formula_list(db: psycopg2.extensions.connection = Depends(get_db)):
+    """获取所有公式配置"""
+    with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("SELECT * FROM formula_config ORDER BY create_time DESC")
+        formulas = cur.fetchall()
+        # 解析JSONB类型的关联参数ID、BOM物料ID
+        formulas_list = []
+        for formula in formulas:
+            formula_dict = dict(formula)
+            formula_dict["param_ids"] = formula_dict["param_ids"]  # PostgreSQL JSONB直接转换为Python列表
+            formula_dict["bom_ids"] = formula_dict["bom_ids"] if formula_dict["bom_ids"] else []
+            formulas_list.append(formula_dict)
+        return {"code": 200, "data": formulas_list}
+
+@app.post("/api/formula/add", response_model=Dict[str, Any])
+def add_formula(data: FormulaAdd, db: psycopg2.extensions.connection = Depends(get_db)):
+    """新增公式配置（支持关联BOM物料）"""
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                INSERT INTO formula_config 
+                (formula_name, formula_expr, formula_desc, param_ids, bom_ids, result_unit)
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING formula_id
+            """, (data.formula_name, data.formula_expr, data.formula_desc, data.param_ids, data.bom_ids, data.result_unit))
+            db.commit()
+            formula_id = cur.fetchone()[0]
+        return {"code": 200, "msg": "公式配置新增成功", "data": {"formula_id": formula_id}}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"新增失败：{str(e)}")
+
+# 5.4 工艺配置管理（新增/查询/修改/删除）
+@app.get("/api/process/list", response_model=Dict[str, Any])
+def get_process_list(db: psycopg2.extensions.connection = Depends(get_db)):
+    """获取所有工艺配置"""
+    with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("SELECT * FROM process_config ORDER BY create_time DESC")
+        processes = cur.fetchall()
+        processes_list = [dict(process) for process in processes]
+        return {"code": 200, "data": processes_list}
+
+@app.post("/api/process/add", response_model=Dict[str, Any])
+def add_process(data: ProcessAdd, db: psycopg2.extensions.connection = Depends(get_db)):
+    """新增工艺配置"""
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                INSERT INTO process_config 
+                (process_name, add_type, add_expr, min_order)
+                VALUES (%s, %s, %s, %s) RETURNING process_id
+            """, (data.process_name, data.add_type, data.add_expr, data.min_order))
+            db.commit()
+            process_id = cur.fetchone()[0]
+        return {"code": 200, "msg": "工艺配置新增成功", "data": {"process_id": process_id}}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"新增失败：{str(e)}")
+
+# 5.5 报价组成配置管理（新增/查询/修改/删除，新增开模费项）
+@app.get("/api/component/list", response_model=Dict[str, Any])
+def get_component_list(db: psycopg2.extensions.connection = Depends(get_db)):
+    """获取所有报价组成配置（含开模费）"""
+    with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("SELECT * FROM quote_component ORDER BY create_time DESC")
+        components = cur.fetchall()
+        components_list = [dict(component) for component in components]
+        return {"code": 200, "data": components_list}
+
+@app.post("/api/component/add", response_model=Dict[str, Any])
+def add_component(data: ComponentAdd, db: psycopg2.extensions.connection = Depends(get_db)):
+    """新增报价组成配置（支持开模费类型）"""
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                INSERT INTO quote_component 
+                (component_name, calc_expr, component_type, is_required)
+                VALUES (%s, %s, %s, %s) RETURNING component_id
+            """, (data.component_name, data.calc_expr, data.component_type, data.is_required))
+            db.commit()
+            component_id = cur.fetchone()[0]
+        return {"code": 200, "msg": "报价组成新增成功", "data": {"component_id": component_id}}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"新增失败：{str(e)}")
+
+# -------------------------- 6. 核心模块2：BOM物料管理（新增，支持灵活引用） --------------------------
+@app.get("/api/bom/list", response_model=Dict[str, Any])
+def get_bom_list(bom_type: Optional[str] = None, db: psycopg2.extensions.connection = Depends(get_db)):
+    """获取BOM物料列表（可按类型筛选）"""
+    with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        if bom_type:
+            cur.execute("SELECT * FROM bom_material WHERE bom_type = %s AND is_active = 1 ORDER BY create_time DESC", (bom_type,))
+        else:
+            cur.execute("SELECT * FROM bom_material WHERE is_active = 1 ORDER BY create_time DESC")
+        boms = cur.fetchall()
+        boms_list = [dict(bom) for bom in boms]
+        return {"code": 200, "data": boms_list}
+
+@app.post("/api/bom/add", response_model=Dict[str, Any])
+def add_bom(data: BomAdd, db: psycopg2.extensions.connection = Depends(get_db)):
+    """新增BOM物料"""
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                INSERT INTO bom_material 
+                (bom_name, bom_type, bom_price, price_unit, bom_desc)
+                VALUES (%s, %s, %s, %s, %s) RETURNING bom_id
+            """, (data.bom_name, data.bom_type, data.bom_price, data.price_unit, data.bom_desc))
+            db.commit()
+            bom_id = cur.fetchone()[0]
+        return {"code": 200, "msg": "BOM物料新增成功", "data": {"bom_id": bom_id}}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"新增失败：{str(e)}")
+
+# -------------------------- 7. 核心模块3：开模规则管理（新增，适配5000以下加开模费） --------------------------
+@app.get("/api/mold/rule/list", response_model=Dict[str, Any])
+def get_mold_rule_list(db: psycopg2.extensions.connection = Depends(get_db)):
+    """获取所有开模规则"""
+    with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("SELECT * FROM mold_rule ORDER BY create_time DESC")
+        rules = cur.fetchall()
+        rules_list = [dict(rule) for rule in rules]
+        return {"code": 200, "data": rules_list}
+
+@app.post("/api/mold/rule/add", response_model=Dict[str, Any])
+def add_mold_rule(data: MoldRuleAdd, db: psycopg2.extensions.connection = Depends(get_db)):
+    """新增开模规则（支持固定金额/公式，适配阈值判断）"""
+    # 校验参数：固定类型必须传金额，公式类型必须传公式
+    if data.mold_fee_type == "fixed" and data.mold_fee_value is None:
+        raise HTTPException(status_code=400, detail="固定金额开模费，必须传入mold_fee_value")
+    if data.mold_fee_type == "formula" and data.mold_fee_expr is None:
+        raise HTTPException(status_code=400, detail="公式计算开模费，必须传入mold_fee_expr")
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                INSERT INTO mold_rule 
+                (rule_name, min_quantity, mold_fee_type, mold_fee_value, mold_fee_expr, rule_desc)
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING rule_id
+            """, (data.rule_name, data.min_quantity, data.mold_fee_type, data.mold_fee_value, data.mold_fee_expr, data.rule_desc))
+            db.commit()
+            rule_id = cur.fetchone()[0]
+        return {"code": 200, "msg": "开模规则新增成功", "data": {"rule_id": rule_id}}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"新增失败：{str(e)}")
+
+# -------------------------- 8. 核心模块4：报价模板管理（封装所有配置，含BOM+开模规则） --------------------------
+@app.get("/api/template/list", response_model=Dict[str, Any])
+def get_template_list(db: psycopg2.extensions.connection = Depends(get_db)):
+    """获取所有报价模板（含BOM物料、开模规则关联）"""
+    with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("""
+            SELECT t.*, pt.type_name, mr.rule_name as mold_rule_name, mr.min_quantity as mold_min_quantity
+            FROM quote_template t
+            LEFT JOIN product_type pt ON t.type_id = pt.type_id
+            LEFT JOIN mold_rule mr ON t.mold_rule_id = mr.rule_id
+            ORDER BY t.create_time DESC
+        """)
+        templates = cur.fetchall()
+        # 解析JSONB类型的关联ID列表
+        templates_list = []
+        for template in templates:
+            template_dict = dict(template)
+            template_dict["formula_ids"] = template_dict["formula_ids"]
+            template_dict["component_ids"] = template_dict["component_ids"]
+            template_dict["process_ids"] = template_dict["process_ids"] if template_dict["process_ids"] else []
+            template_dict["bom_ids"] = template_dict["bom_ids"] if template_dict["bom_ids"] else []
+            templates_list.append(template_dict)
+        return {"code": 200, "data": templates_list}
+
+@app.post("/api/template/add", response_model=Dict[str, Any])
+def add_template(data: TemplateAdd, db: psycopg2.extensions.connection = Depends(get_db)):
+    """新增报价模板（关联BOM物料、开模规则）"""
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                INSERT INTO quote_template 
+                (template_name, type_id, formula_ids, component_ids, process_ids, bom_ids, mold_rule_id, template_desc)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING template_id
+            """, (data.template_name, data.type_id, data.formula_ids, data.component_ids, data.process_ids, data.bom_ids, data.mold_rule_id, data.template_desc))
+            db.commit()
+            template_id = cur.fetchone()[0]
+        return {"code": 200, "msg": "报价模板新增成功", "data": {"template_id": template_id}}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"新增失败：{str(e)}")
+
+# -------------------------- 9. 核心模块5：报价计算（调用自定义配置+BOM+开模规则，自动执行） --------------------------
+def calculate_quote_by_template(params: QuoteCalculateParams, db: psycopg2.extensions.connection) -> Dict[str, Any]:
+    """
+    根据用户选择的模板，输入的参数，自动执行报价计算（含BOM引用、开模费判断）
+    :param params: 前端传入参数（包含template_id、param_values、process_ids、bom_ids等）
+    :param db: 数据库连接
+    :return: 报价结果（字典）
+    """
+    # 1. 解析参数
+    template_id = params.template_id
+    param_values = params.param_values  # 输入的参数值（key=param_name，value=值）
+    process_ids = params.process_ids if params.process_ids else []  # 选中的工艺ID
+    bom_ids = params.bom_ids if params.bom_ids else []  # 选中的BOM物料ID（灵活选择，优先级高于模板默认BOM）
+    order_quantity = int(param_values.get("order_quantity", 1))  # 订单数量（默认1）
+
+    # 2. 查询模板关联的所有配置
+    with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        # 2.1 查询模板信息（含关联的BOM、开模规则）
+        cur.execute("""
+            SELECT t.*, mr.*
+            FROM quote_template t
+            LEFT JOIN mold_rule mr ON t.mold_rule_id = mr.rule_id
+            WHERE t.template_id = %s
+        """, (template_id,))
+        template = cur.fetchone()
+        if not template:
+            raise HTTPException(status_code=404, detail="报价模板不存在")
+        # 解析模板关联的ID列表（PostgreSQL JSONB直接转换为Python列表）
+        formula_ids = template["formula_ids"]
+        component_ids = template["component_ids"]
+        type_id = template["type_id"]
+        # 处理BOM物料ID：前端手动选择的BOM优先级高于模板默认BOM
+        final_bom_ids = bom_ids if bom_ids else (template["bom_ids"] if template["bom_ids"] else [])
+        # 处理开模规则：模板关联的开模规则
+        mold_rule = dict(template) if template["rule_id"] else None  # 开模规则信息
+
+        # 2.2 查询产品类型对应的参数配置（校验输入参数是否完整）
+        cur.execute("SELECT * FROM param_config WHERE type_id = %s", (type_id,))
+        param_configs = cur.fetchall()
+        # 校验必填参数
+        for param in param_configs:
+            if param["is_required"] == 1 and param["param_name"] not in param_values:
+                raise HTTPException(status_code=400, detail=f"必填参数缺失：{param['param_name']}")
+            # 补充默认值（若未输入）
+            if param["param_name"] not in param_values and param["default_value"]:
+                param_values[param["param_name"]] = param["default_value"]
+
+        # 2.3 查询模板关联的公式配置
+        if formula_ids:
+            placeholders = ", ".join(["%s"] * len(formula_ids))
+            cur.execute(f"SELECT * FROM formula_config WHERE formula_id IN ({placeholders})", formula_ids)
+        else:
+            cur.execute("SELECT * FROM formula_config WHERE 1=0")
+        formulas = cur.fetchall()
+
+        # 2.4 查询模板关联的报价组成配置
+        if component_ids:
+            placeholders = ", ".join(["%s"] * len(component_ids))
+            cur.execute(f"SELECT * FROM quote_component WHERE component_id IN ({placeholders})", component_ids)
+        else:
+            cur.execute("SELECT * FROM quote_component WHERE 1=0")
+        components = cur.fetchall()
+
+        # 2.5 查询选中的工艺配置
+        if process_ids:
+            placeholders = ", ".join(["%s"] * len(process_ids))
+            cur.execute(f"SELECT * FROM process_config WHERE process_id IN ({placeholders})", process_ids)
+        else:
+            cur.execute("SELECT * FROM process_config WHERE 1=0")
+        processes = cur.fetchall()
+
+        # 2.6 查询选中的BOM物料（灵活引用，用于公式计算）
+        bom_dict = {}  # 存储BOM物料（key=bom_price_+bom_id，value=物料单价）
+        bom_details = []  # BOM物料明细（用于报价单展示）
+        if final_bom_ids:
+            placeholders = ", ".join(["%s"] * len(final_bom_ids))
+            cur.execute(f"SELECT * FROM bom_material WHERE bom_id IN ({placeholders}) AND is_active = 1", final_bom_ids)
+            boms = cur.fetchall()
+            for bom in boms:
+                bom_key = f"bom_price_{bom['bom_id']}"  # 公式中引用BOM的格式：bom_price_1
+                bom_dict[bom_key] = bom["bom_price"]
+                bom_details.append({
+                    "bom_id": bom["bom_id"],
+                    "bom_name": bom["bom_name"],
+                    "bom_price": bom["bom_price"],
+                    "price_unit": bom["price_unit"]
+                })
+
+        # 3. 计算开模费（新增，适配5000以下加开模费）
+        mold_fee = calculate_mold_fee(order_quantity, mold_rule, param_values)
+        # 将开模费加入计算参数，用于后续报价组成计算
+        calc_params = param_values.copy()
+        calc_params["mold_fee"] = mold_fee
+
+        # 4. 执行公式计算（顺序执行，支持公式嵌套+BOM物料引用）
+        formula_results = {}  # 存储公式计算结果（key=公式名称，value=结果）
+        for formula in formulas:
+            formula_name = formula["formula_name"]
+            formula_expr = formula["formula_expr"]
+            # 解析公式，代入参数和BOM物料值计算
+            result = parse_formula(formula_expr, calc
